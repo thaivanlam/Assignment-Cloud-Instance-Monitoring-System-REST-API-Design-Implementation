@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.34
+SQLAlchemy>=2.0.43
+pydantic>=2.12
+pydantic-settings>=2.7
+PyJWT>=2.10
+email-validator>=2.2
+anthropic>=0.116.0
