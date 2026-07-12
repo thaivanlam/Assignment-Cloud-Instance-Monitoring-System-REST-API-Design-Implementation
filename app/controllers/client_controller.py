@@ -1,0 +1,88 @@
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.core.deps import (
+    accessible_client_ids,
+    assert_client_access,
+    get_current_member,
+    require_admin,
+)
+from app.database import get_db
+from app.models import Member
+from app.schemas.schemas import (
+    ClientCostResponse,
+    ClientCreate,
+    ClientOut,
+    CostForecastResponse,
+    InstanceOut,
+    SlaResponse,
+)
+from app.services import client_service
+
+router = APIRouter(prefix="/api/clients", tags=["Clients"])
+
+
+@router.post("", response_model=ClientOut, status_code=201, summary="Register client (ADMIN only)")
+def create_client(
+    body: ClientCreate,
+    db: Session = Depends(get_db),
+    _admin: Member = Depends(require_admin),
+):
+    return client_service.create_client(db, body)
+
+
+@router.get("", response_model=list[ClientOut], summary="Get all clients (scoped by role)")
+def list_clients(db: Session = Depends(get_db), member: Member = Depends(get_current_member)):
+    return client_service.list_clients(db, accessible_client_ids(member, db))
+
+
+@router.get("/{client_id}/instances", response_model=list[InstanceOut], summary="Get instances by client")
+def client_instances(
+    client_id: int,
+    db: Session = Depends(get_db),
+    member: Member = Depends(get_current_member),
+):
+    client = client_service.get_client(db, client_id)
+    assert_client_access(member, client)
+    return client_service.get_client_instances(db, client_id)
+
+
+@router.get("/{client_id}/cost", response_model=ClientCostResponse, summary="Monthly cost total by client")
+def client_cost(
+    client_id: int,
+    db: Session = Depends(get_db),
+    member: Member = Depends(get_current_member),
+):
+    client = client_service.get_client(db, client_id)
+    assert_client_access(member, client)
+    return client_service.get_client_cost(db, client_id)
+
+
+@router.get(
+    "/{client_id}/cost-forecast",
+    response_model=CostForecastResponse,
+    summary="Next month cost forecast (RUNNING instances x unit price)",
+)
+def client_cost_forecast(
+    client_id: int,
+    db: Session = Depends(get_db),
+    member: Member = Depends(get_current_member),
+):
+    client = client_service.get_client(db, client_id)
+    assert_client_access(member, client)
+    return client_service.get_cost_forecast(db, client_id)
+
+
+@router.get(
+    "/{client_id}/sla",
+    response_model=SlaResponse,
+    summary="SLA uptime calculation (PREMIUM 99.9 / STANDARD 99 / BASIC 95)",
+)
+def client_sla(
+    client_id: int,
+    db: Session = Depends(get_db),
+    member: Member = Depends(get_current_member),
+):
+    client = client_service.get_client(db, client_id)
+    assert_client_access(member, client)
+    return client_service.get_sla(db, client_id)
