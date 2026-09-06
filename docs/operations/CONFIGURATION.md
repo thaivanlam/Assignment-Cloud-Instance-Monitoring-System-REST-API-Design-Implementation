@@ -106,6 +106,14 @@ Two details that have caused confusion before:
   setting is empty it constructs the client with no key and lets the SDK resolve
   credentials itself (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or an `ant auth login`
   profile) — so a diagnosis can succeed on a machine where this setting is blank.
+- **The credential is resolved once per process.** The SDK client is built on the first
+  diagnosis and reused
+  ([../performance/PERFORMANCE_BUGS.md § PERF-14](../performance/PERFORMANCE_BUGS.md#perf-14)),
+  so whichever credential it finds — this setting, the environment variable, or an
+  `ant auth login` profile — is the one it keeps until the process restarts. A
+  *construction* failure is not cached, so a keyless process retries on every request
+  instead of latching into the fallback — but `.env` is read at import, so both adding and
+  rotating a key there need a restart.
 - **A wrong key is not an outage.** The call fails, the fallback answers, and the process
   logs one warning line ([RUNBOOKS.md § R11](RUNBOOKS.md#r11--diagnosis-answers-rule-based-when-a-key-is-configured)).
 

@@ -19,6 +19,9 @@ REAL_LLM_DIAGNOSIS = llm_service._llm_diagnosis
 def offline(monkeypatch):
     """Default to 'no LLM available', the state of a machine without an API key."""
     monkeypatch.setattr(llm_service, "_llm_diagnosis", lambda instance, alerts: None)
+    # The provider client is built once per process and cached (PERF-14). Clearing it per
+    # test keeps a stubbed SDK from leaking a client into the next test that builds one.
+    monkeypatch.setattr(llm_service, "_client", None)
     return monkeypatch
 
 
@@ -125,6 +128,38 @@ def test_diagnosis_returns_the_text_the_provider_produced(api, auth_headers, off
     prompt = sent["messages"][0]["content"]
     assert "hnlog-worker-01" in prompt
     assert "Status: ERROR" in prompt
+
+
+def test_the_provider_client_is_built_once_and_reused(api, auth_headers, offline):
+    """PERF-14: one SDK client serves the process, so a second diagnosis reuses its
+    connection pool instead of opening a new one."""
+    client, _ = api
+    built = []
+
+    def fake_create(**kwargs):
+        return types.SimpleNamespace(
+            stop_reason="end_turn",
+            content=[types.SimpleNamespace(type="text", text="Diagnosis from the model.")],
+        )
+
+    def fake_anthropic(*args, **kwargs):
+        # Only the limits are recorded — an api_key would otherwise reach a failure report.
+        built.append({key: kwargs.get(key) for key in ("timeout", "max_retries")})
+        return types.SimpleNamespace(messages=types.SimpleNamespace(create=fake_create))
+
+    offline.setattr(llm_service, "_llm_diagnosis", REAL_LLM_DIAGNOSIS)
+    offline.setattr(anthropic, "Anthropic", fake_anthropic)
+
+    first = client.get("/api/instances/5/diagnosis", headers=auth_headers["manager1"])
+    second = client.get("/api/instances/1/diagnosis", headers=auth_headers["manager1"])
+
+    assert [first.status_code, second.status_code] == [200, 200]
+    assert [first.json()["source"], second.json()["source"]] == ["llm", "llm"]
+    # Two diagnoses, one client — the assertion the finding is about.
+    assert len(built) == 1
+    # The PERF-03 request limits ride on the shared client, not on a per-call one.
+    assert built[0]["timeout"] == llm_service.TIMEOUT_SECONDS
+    assert built[0]["max_retries"] == llm_service.MAX_RETRIES
 
 
 def test_diagnosis_works_for_a_healthy_instance_too(api, auth_headers):

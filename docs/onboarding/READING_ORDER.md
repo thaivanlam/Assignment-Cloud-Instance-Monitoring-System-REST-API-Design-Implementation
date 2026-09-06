@@ -12,7 +12,7 @@ models before the services, the services before the controllers that delegate to
   to change code safely inside one vertical slice.
 - **Prerequisites:** Python, and enough FastAPI to recognise `Depends`. SQLAlchemy 2.0 and
   Pydantic v2 details are explained where they first appear.
-- **Scope:** 82 numbered stops across the 18 source files under `app/`, plus the seed and
+- **Scope:** 83 numbered stops across the 18 source files under `app/`, plus the seed and
   the test fixtures.
 
 ---
@@ -29,7 +29,7 @@ models before the services, the services before the controllers that delegate to
 | [5](#stage-5--monitoring-where-the-business-rules-live) | Thresholds, auto-alerts, deduplication, the batched scan | `monitor_service.py`, `monitor_controller.py` | 12 |
 | [6](#stage-6--alerts) | Alert history and resolution | `alert_service.py`, `alert_controller.py` | 4 |
 | [7](#stage-7--clients-cost-and-sla) | Money and uptime arithmetic | `client_service.py`, `client_controller.py` | 15 |
-| [8](#stage-8--the-llm-diagnosis-feature) | The one external call, and its fallback | `llm_service.py` | 4 |
+| [8](#stage-8--the-llm-diagnosis-feature) | The one external call, and its fallback | `llm_service.py` | 5 |
 | [9](#stage-9--seed-data-and-tests) | Where the demo numbers come from | `seed.py`, `tests/` | 3 |
 
 ---
@@ -396,14 +396,15 @@ endpoints; the first uses `require_admin`, the rest `get_client` + `assert_clien
 [app/services/llm_service.py](../../app/services/llm_service.py) — the only outbound
 network call in the system, and the only function that must never fail.
 
-Read it **bottom-up**: `diagnose` is three lines and tells you what the other three are for.
+Read it **bottom-up**: `diagnose` is three lines and tells you what the other four are for.
 
 | # | Function | Line | What to take away |
 |---:|---|---|---|
-| 76 | `_build_context` | [llm_service.py:27](../../app/services/llm_service.py#L27) | Formats instance fields plus recent alerts into plain text — shared by the prompt, and easy to test. |
-| 77 | `_llm_diagnosis` | [llm_service.py:47](../../app/services/llm_service.py#L47) | The Anthropic SDK call, with `import anthropic` *inside* the function so the dependency stays optional. Two comments worth reading: the SDK never reads `.env`, so the key is handed over explicitly; and adaptive thinking spends the same token budget, so `max_tokens` is generous. Both client branches carry `TIMEOUT_SECONDS` / `MAX_RETRIES` — without them the SDK waits up to 30 minutes. **Any** exception returns `None`, a timeout included. |
-| 78 | `_rule_based_diagnosis` | [llm_service.py:95](../../app/services/llm_service.py#L95) | A deterministic fallback in the same three-section format, built from CPU level, alert history, instance type and region. |
-| 79 | `diagnose` | [llm_service.py:125](../../app/services/llm_service.py#L125) | Try the LLM, fall back, return `(text, source)` — `source` is surfaced in the response so a caller can always tell which path ran. |
+| 76 | `_get_client` | [llm_service.py:34](../../app/services/llm_service.py#L34) | The single Anthropic client the process uses: built on the first diagnosis behind a double-checked lock, reused by every one after it. A client per request meant a connection pool per request ([../performance/PERFORMANCE_BUGS.md § PERF-14](../performance/PERFORMANCE_BUGS.md#perf-14)). `import anthropic` sits *inside* it, so the dependency stays optional; the SDK never reads `.env`, so the key is handed over explicitly; and both branches carry `TIMEOUT_SECONDS` / `MAX_RETRIES` — without them the SDK waits up to 30 minutes. |
+| 77 | `_build_context` | [llm_service.py:61](../../app/services/llm_service.py#L61) | Formats instance fields plus recent alerts into plain text — shared by the prompt, and easy to test. |
+| 78 | `_llm_diagnosis` | [llm_service.py:81](../../app/services/llm_service.py#L81) | The Anthropic SDK call itself, now three lines shorter: it asks `_get_client` for the client and sends the request. One comment worth reading — adaptive thinking spends the same token budget, so `max_tokens` is generous. **Any** exception returns `None`, a timeout included, and so does the one `_get_client` raises on a machine with no credential. |
+| 79 | `_rule_based_diagnosis` | [llm_service.py:117](../../app/services/llm_service.py#L117) | A deterministic fallback in the same three-section format, built from CPU level, alert history, instance type and region. |
+| 80 | `diagnose` | [llm_service.py:147](../../app/services/llm_service.py#L147) | Try the LLM, fall back, return `(text, source)` — `source` is surfaced in the response so a caller can always tell which path ran. |
 
 **The design point:** this endpoint has no failure mode. No API key, no network, a bad
 response — all produce a useful answer with `source: "rule-based"`, which is why the demo
@@ -426,7 +427,7 @@ exercise every rule you have just read:
 | Seeded case | Rule it demonstrates |
 |---|---|
 | `health-api-01` 96.3%, `vinasoft-web-01` 91.5%, `fintech-core-02` 88.4%, `hnlog-api-01` 85.2% | four `CPU_HIGH` warnings (stop 49) |
-| `hnlog-worker-01`, `dnmedia-stream-01` in `ERROR` | `ERROR_DETECTED` and the diagnosis endpoint (stops 50, 79) |
+| `hnlog-worker-01`, `dnmedia-stream-01` in `ERROR` | `ERROR_DETECTED` and the diagnosis endpoint (stops 50, 80) |
 | `sgretail-report-01` 120h, `green-iot-01` 96h, `vinasoft-batch-01` 72h stopped | `LONG_STOPPED` past the 48h threshold (stop 51) |
 | clients 1–5 → `lam@`, clients 6–10 → `minh@` | role scoping (stops 31, 32) |
 
@@ -435,14 +436,14 @@ Exact figures: [../demo/SEED_DATA.md](../demo/SEED_DATA.md).
 ### 9.2 `tests/`
 
 [tests/conftest.py](../../tests/conftest.py) first — four fixtures, and they explain how
-128 tests run in seconds:
+129 tests run in seconds:
 
 | # | Fixture | Line | What to take away |
 |---:|---|---|---|
-| 80 | `memoised_seed_hashing` | [conftest.py:18](../../tests/conftest.py#L18) | Session-scoped: memoises `hash_password` *for the seed only*, because 260,000 PBKDF2 iterations × 3 passwords × every test dominated the runtime. `verify_password` still does real work on every login. |
-| 81 | `api` | [conftest.py:35](../../tests/conftest.py#L35) | A fresh in-memory SQLite database per test, held open by `StaticPool`, seeded, and injected by overriding `get_db` (stop 10). Note the `engine.dispose()` in `finally`. |
-| 82 | `auth_headers` | [conftest.py:74](../../tests/conftest.py#L74) | Logs in as all three demo accounts and returns ready-made `Authorization` headers — most tests start here. |
-| 83 | `empty_scope_headers` | [conftest.py:93](../../tests/conftest.py#L93) | A fourth account the seed does not create: a `CLIENT_MANAGER` with no clients. It exists because an empty scope is the case both guards of stop 31–32 are easiest to get wrong — it has to keep meaning *nothing*. |
+| 81 | `memoised_seed_hashing` | [conftest.py:18](../../tests/conftest.py#L18) | Session-scoped: memoises `hash_password` *for the seed only*, because 260,000 PBKDF2 iterations × 3 passwords × every test dominated the runtime. `verify_password` still does real work on every login. |
+| 82 | `api` | [conftest.py:35](../../tests/conftest.py#L35) | A fresh in-memory SQLite database per test, held open by `StaticPool`, seeded, and injected by overriding `get_db` (stop 10). Note the `engine.dispose()` in `finally`. |
+| 83 | `auth_headers` | [conftest.py:74](../../tests/conftest.py#L74) | Logs in as all three demo accounts and returns ready-made `Authorization` headers — most tests start here. |
+| 84 | `empty_scope_headers` | [conftest.py:93](../../tests/conftest.py#L93) | A fourth account the seed does not create: a `CLIENT_MANAGER` with no clients. It exists because an empty scope is the case both guards of stop 31–32 are easiest to get wrong — it has to keep meaning *nothing*. |
 
 Then read the suites in the same order as this document:
 

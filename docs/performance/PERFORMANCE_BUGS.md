@@ -1,13 +1,13 @@
 # Performance Bugs
 
 A review of `app/` for defects that cost latency, throughput, or concurrency. Fifteen
-findings, ranked by the load at which they start to hurt. Twelve — [PERF-01](#perf-01)
-through [PERF-12](#perf-12) — have since been fixed; the **Status** column below says
-which are still open.
+findings, ranked by the load at which they start to hurt. Thirteen — [PERF-01](#perf-01)
+through [PERF-12](#perf-12), and [PERF-14](#perf-14) — have since been fixed; the
+**Status** column below says which are still open.
 
 Nothing here is a functional bug — every one of the tests passes, and the API returns
 correct answers. These are the places where it stops returning them *fast*, or stops
-returning them *at all* under concurrency. (The suite has grown from 104 cases to 128
+returning them *at all* under concurrency. (The suite has grown from 104 cases to 129
 across these fixes; each finding below quotes the count at the time it landed.)
 
 **Every number below was measured**, not estimated. The method is in
@@ -33,7 +33,7 @@ challenged.
 | [PERF-11](#perf-11) | Authorization check lazy-loads a relationship per request | `core/deps.py`, controllers | Medium | **Fixed** |
 | [PERF-12](#perf-12) | Aggregates computed in Python over fully loaded rows | `services/client_service.py` | Medium | **Fixed** |
 | [PERF-13](#perf-13) | PBKDF2 at 260,000 iterations dominates the login path | `core/security.py` | Low (by design) | Won't fix |
-| [PERF-14](#perf-14) | A new Anthropic HTTP client is built per diagnosis request | `services/llm_service.py` | Low | Open |
+| [PERF-14](#perf-14) | A new Anthropic HTTP client is built per diagnosis request | `services/llm_service.py` | Low | **Fixed** |
 | [PERF-15](#perf-15) | `create_all` and the seed probe run on every startup | `main.py`, `seed.py` | Low | Open |
 
 ---
@@ -267,8 +267,9 @@ What this does **not** fix: the request still occupies one of the 40 threadpool 
 for the length of the call — bounded at 60 seconds now, but still held. Releasing that
 too means `async def` plus `AsyncAnthropic`, which
 [../design/LLM_FEATURE.md § 8](../design/LLM_FEATURE.md#8-known-limitations-and-future-work)
-records as future work. The client is also still constructed per request
-([PERF-14](#perf-14)).
+records as future work. The client was also still constructed per request at the time,
+which [PERF-14](#perf-14) has since fixed — the limits above now ride on the one client the
+process keeps.
 
 ---
 
@@ -1519,6 +1520,7 @@ weakening the KDF.
 ### PERF-14
 
 **A new Anthropic HTTP client is constructed per diagnosis request.**
+**Fixed** — see [The fix that landed](#the-fix-that-landed-12) at the end of this finding.
 
 [llm_service.py:57](../../app/services/llm_service.py#L57) builds
 `anthropic.Anthropic(...)` on every call. Each construction creates a fresh `httpx` client
@@ -1530,6 +1532,79 @@ collector.
 `timeout` and `max_retries` [PERF-03](#perf-03) added. The `import anthropic` inside the
 function is fine as is (module imports are cached after the first call), but the client
 should not follow it.
+
+#### The fix that landed
+
+Exactly that. `_get_client` ([llm_service.py:34](../../app/services/llm_service.py#L34))
+holds the module-level `_client` and builds it on the first diagnosis;
+`_llm_diagnosis` now opens with `_get_client().messages.create(...)` and carries no
+construction of its own. The credential branch is unchanged — the explicit `api_key` when
+`.env` supplied one, the SDK's own resolution otherwise — and both branches still pass
+`TIMEOUT_SECONDS` and `MAX_RETRIES`, so [PERF-03](#perf-03)'s limits now belong to the one
+client instead of being re-applied per request.
+
+Two details the obvious version gets wrong:
+
+- **The lock.** Construction sits behind a double-checked `threading.Lock`. FastAPI runs
+  these endpoints on 40 threadpool workers, so several diagnoses can reach a cold process
+  together; without it, each would build a client and all but one would be thrown away —
+  the exact cost this finding is about, paid once more at the worst moment.
+- **A failure is not cached.** `_client` is only assigned when construction succeeds. On a
+  machine with no credential the SDK raises inside `_get_client`, `_llm_diagnosis` catches
+  it like any other provider failure and answers from the rule-based fallback, and the next
+  request is free to try again — a keyless process behaves as it always did rather than
+  latching into a permanent fallback. It is not a hot key reload: `settings` is read at
+  import, so a key added to `.env` still needs a restart.
+
+**Connections.** Measured by pointing the SDK at a local HTTP server with `base_url`, so
+the transport, the pool and the keep-alive handling are the SDK's real ones and nothing
+leaves the machine — the server counts the connections it accepts for ten diagnoses:
+
+| | TCP connections for 10 diagnoses |
+|---|---|
+| Before | 10 |
+| After | **1** |
+
+Against the real provider each of those ten is a TLS handshake as well.
+
+**The work removed.** One client construction per diagnosis, timed around the
+construction itself inside the request path with `messages.create` stubbed on an otherwise
+real client:
+
+| | Construction per request |
+|---|---|
+| Before | 6.2–22.5 ms, median per run |
+| After | **0**, after the first |
+
+The range is the machine, not the measurement: the same script reports ~6 ms on an idle
+run and ~21 ms on a busy one, and building a client on its own outside the app measures
+5.7–7.0 ms. What the fix removes is all of it, on every request after the first.
+
+**What is deliberately not quoted here is an end-to-end latency figure.** The request
+median under `TestClient` moves by more between two runs of the *same* variant than it
+does between the two variants — 16 ms to 27 ms for the fixed shape across three runs — so
+this harness cannot resolve a 6 ms difference inside a request that also decodes a JWT,
+queries the database and serialises a response. An earlier draft of this finding quoted a
+38.2 ms → 14.2 ms median from a single interleaved run; it did not reproduce, and it is
+recorded here as withdrawn rather than quietly dropped. The connection count above is this
+finding's evidence, and it is exact.
+
+Peak allocation per request is unchanged at ~113 KiB: a client is 6.5 KiB, small against
+what the request already allocates. This was never a memory finding — it is a handshake
+per call, and a pool per call left for the collector: neither `anthropic.Anthropic` nor
+`httpx.Client` defines `__del__`, so an abandoned client's sockets are released whenever
+its objects are deallocated and not at any point the code chooses.
+
+All 129 functional tests pass — the 128 that existed, unchanged, plus one added here.
+`test_the_provider_client_is_built_once_and_reused` drives two diagnoses through a stubbed
+SDK and asserts one client was constructed, with `TIMEOUT_SECONDS` and `MAX_RETRIES` on it.
+The `offline` fixture clears `_client` per test, so a stubbed client cannot outlive the
+test that installed it.
+
+What this does **not** fix: the client is never explicitly closed, so its pool is released
+when the process exits rather than on shutdown. Closing it in the lifespan hook is one
+line, and was left out deliberately — it is only correct once nothing can call `diagnose`
+after shutdown has begun, which is a claim about the server, not about this module.
 
 ---
 
@@ -1569,6 +1644,7 @@ Ordered by benefit per unit of risk, not by severity.
 | 8c | Drop the lazy loads | [PERF-11](#perf-11) | Medium — **done** |
 | 9 | Paginate the remaining list endpoints | [PERF-07](#perf-07) | **Breaking** — API contract — **done** |
 | 10 | Count the forecast in SQL | [PERF-12](#perf-12) | Low — one function, same answer — **done** |
+| 11 | One Anthropic client for the process | [PERF-14](#perf-14) | Low — one function, no behaviour — **done** |
 
 Steps 1–5 are schema and configuration; none of them changes any documented behaviour. Step 6
 touched a rule documented in [../business-rules/ALERTING.md](../business-rules/ALERTING.md)
@@ -1744,6 +1820,26 @@ engine, with `_llm_diagnosis` replaced by a `threading.Barrier` so that all 20 s
 the stand-in for the network call at the same instant; one of them reads
 `engine.pool.checkedout()` there. Running it with and without the early `db.close()`
 is the before/after table under [PERF-03](#perf-03).
+
+**Provider connections and client cost** — the two tables under [PERF-14](#perf-14) come
+from a pair of scripts that never reach the network. The connection count uses a local
+`ThreadingHTTPServer` returning a valid Messages response, with the SDK pointed at it
+through `base_url`, so the transport, the pool and the keep-alive handling are the SDK's
+own; the server counts the connections it accepts while ten diagnoses run, once with a
+client per call and once with one shared. The construction figure uses the same
+`TestClient` harness as the rest of this document, with the pre-fix shape — a fresh client
+per request — restored as a monkeypatch of `_get_client` and `messages.create` stubbed on
+an otherwise real client, so the construction being timed is the real one; the timer is
+around the construction alone rather than the request, and every half asserts a `source`
+of `"llm"` before reporting. Its range is the median of 150 requests, taken across several
+runs on a machine doing other things. The standalone 5.7–7.0 ms is the median of 100–200
+constructions outside the app.
+
+That timer is around the construction and not the request for a reason worth recording:
+timing the whole request was tried first and cannot support a claim. Three runs of the
+fixed shape alone gave request medians of 16.4, 19.5 and 26.8 ms, a spread wider than the
+effect being measured, and an interleaved paired run that appeared to show 38.2 ms → 14.2
+ms did not reproduce when the variants were run in blocks. That figure is withdrawn.
 
 Caveats worth stating: most counts come from the 15-instance seed, so absolute numbers are
 small — what matters is which of them **scale with the result set**. Nothing measured here

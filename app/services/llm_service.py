@@ -7,6 +7,7 @@ always works in demo environments without an API key.
 """
 
 import logging
+import threading
 
 from app.config import settings
 from app.models import Alert, Instance
@@ -22,6 +23,42 @@ MODEL = "claude-opus-4-8"
 # a transient connection error. See docs/performance/PERFORMANCE_BUGS.md § PERF-03.
 TIMEOUT_SECONDS = 30.0
 MAX_RETRIES = 1
+
+# One client for the process. Each anthropic.Anthropic() owns an httpx client with its own
+# connection pool, so building one per request meant a TCP and TLS handshake per diagnosis
+# and a pool nobody ever closed. See docs/performance/PERFORMANCE_BUGS.md § PERF-14.
+_client = None
+_client_lock = threading.Lock()
+
+
+def _get_client():
+    """The shared Anthropic client, built on first use.
+
+    The SDK reads the ANTHROPIC_API_KEY *environment variable* — it never reads .env, so
+    the key pydantic-settings loaded has to be handed over explicitly. With nothing
+    configured, fall through to the SDK's own credential resolution (env var,
+    ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile).
+
+    A construction failure is not cached: with no credential at all the SDK raises here and
+    the next call is free to try again, so a keyless process keeps behaving exactly as it
+    did rather than latching into the fallback. (`settings` is read at import, so this is
+    not a way to reload a key from .env without a restart.) The double-checked lock means
+    the client is built exactly once even if several diagnosis requests reach a cold
+    process together.
+    """
+    global _client
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                import anthropic
+
+                api_key = settings.ANTHROPIC_API_KEY.strip()
+                limits = {"timeout": TIMEOUT_SECONDS, "max_retries": MAX_RETRIES}
+                _client = (
+                    anthropic.Anthropic(api_key=api_key, **limits) if api_key
+                    else anthropic.Anthropic(**limits)
+                )
+    return _client
 
 
 def _build_context(instance: Instance, alerts: list[Alert]) -> str:
@@ -46,19 +83,7 @@ def _build_context(instance: Instance, alerts: list[Alert]) -> str:
 
 def _llm_diagnosis(instance: Instance, alerts: list[Alert]) -> str | None:
     try:
-        import anthropic
-
-        # The SDK reads the ANTHROPIC_API_KEY *environment variable* — it never reads
-        # .env, so the key pydantic-settings loaded has to be handed over explicitly.
-        # With nothing configured, fall through to the SDK's own credential resolution
-        # (env var, ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile).
-        api_key = settings.ANTHROPIC_API_KEY.strip()
-        limits = {"timeout": TIMEOUT_SECONDS, "max_retries": MAX_RETRIES}
-        client = (
-            anthropic.Anthropic(api_key=api_key, **limits) if api_key
-            else anthropic.Anthropic(**limits)
-        )
-        response = client.messages.create(
+        response = _get_client().messages.create(
             model=MODEL,
             # Adaptive thinking spends thinking tokens out of this same budget, so a
             # tight cap can consume it all and return an empty or truncated answer.

@@ -4,7 +4,7 @@
 |---|---|
 | System | TechValley Cloud Instance Monitoring System |
 | Document | Test Case specification |
-| Status | Baseline — matches the 128-case automated suite |
+| Status | Baseline — matches the 129-case automated suite |
 | Last reviewed | 2026-09-01 |
 
 The test scenarios, conditions and data used to check the system for defects — each with
@@ -242,6 +242,7 @@ Column meanings: **Steps / data** is the call to make; **Expected** is the exact
 | **TC-DIAG-06** | P3 | A healthy RUNNING instance | `GET /api/instances/2/diagnosis` | `200` with a diagnosis — the endpoint is not restricted to ERROR instances | `diagnosis_works_for_a_healthy_instance_too` |
 | **TC-DIAG-07** | P1 | manager1 token | Diagnose instance `10` (manager2's), then instance `999` | `403`, then `404` | `diagnosis_enforces_scope_and_existence` |
 | **TC-DIAG-08** | P2 | Provider that never answers | Same call | The response arrives within about a minute (30 s timeout, one retry) with `source` = `"rule-based"` | **Manual** — a timing property; specified in [SRS § NFR-PERF-04](../requirements/SRS.md#52-performance) |
+| **TC-DIAG-09** | P3 | Stubbed provider, two diagnoses in one process | `GET /api/instances/5/diagnosis` twice | Both answer `200` with `source` = `"llm"`, and the SDK client is constructed **once** — carrying the 30 s timeout and the single retry ([PERFORMANCE_BUGS § PERF-14](../performance/PERFORMANCE_BUGS.md#perf-14)) | `the_provider_client_is_built_once_and_reused` |
 
 ---
 
@@ -273,7 +274,7 @@ database is freshly seeded.
 
 1. Every P1 case passes. A P1 failure is a release blocker.
 2. Every P2 case passes, or the failure is recorded as a known defect with a decision.
-3. `pytest -q` reports **128 passed**.
+3. `pytest -q` reports **129 passed**.
 4. Any case whose expected value the change moved has been updated **in the same commit**,
    along with [../demo/SEED_DATA.md](../demo/SEED_DATA.md) and
    [../demo/WALKTHROUGH.md](../demo/WALKTHROUGH.md) if the numbers there moved
@@ -334,7 +335,7 @@ Requirement → the cases that verify it. Business-level traceability continues 
 | FR-06 Alert lifecycle | F-ALRT-01, F-ALRT-02 | TC-ALRT-01 … TC-ALRT-18 |
 | FR-07 Cost and forecast | F-CLNT-04, F-CLNT-05 | TC-CLNT-11 … TC-CLNT-17, TC-CLNT-23 |
 | FR-08 SLA reporting | F-CLNT-06 | TC-CLNT-18 … TC-CLNT-22 |
-| FR-09 Diagnosis | F-DIAG-01 | TC-DIAG-01 … TC-DIAG-08 |
+| FR-09 Diagnosis | F-DIAG-01 | TC-DIAG-01 … TC-DIAG-09 |
 | FR-10 Cross-cutting | F-X-01, F-X-02, F-X-03 | TC-X-01 … TC-X-09 |
 | NFR-REL-01 Provider never fails a request | F-DIAG-01 | TC-DIAG-01, TC-DIAG-04 |
 | NFR-REL-04 Repeated writes are no-ops | F-INST-04, F-ALRT-02 | TC-INST-17, TC-ALRT-14 |
