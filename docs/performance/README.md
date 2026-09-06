@@ -5,14 +5,14 @@ it would take to fix.
 
 | Document | Contents |
 |---|---|
-| [PERFORMANCE_BUGS.md](PERFORMANCE_BUGS.md) | 15 measured findings ranked by severity, each with cause, evidence, and fix; a **Status** column saying which are fixed — 12 of 15 so far; a suggested order of work; the measurement method |
+| [PERFORMANCE_BUGS.md](PERFORMANCE_BUGS.md) | 15 measured findings ranked by severity, each with cause, evidence, and fix; a **Status** column saying which are fixed — 13 of 15 so far; a suggested order of work; the measurement method |
 
 ## The short version
 
 Everything in `PERFORMANCE_BUGS.md` is a performance defect, not a functional one — the
 tests pass and the API returns correct answers throughout. Three findings are rated
-critical, and all three are now fixed, as are all four high-severity ones and all five
-medium:
+critical, and all three are now fixed, as are all four high-severity ones, all five
+medium, and one of the three low:
 
 - **PERF-01** — *fixed.* The three `/api/monitor/*` endpoints are `GET`s that wrote and
   committed unconditionally, and SQLite ran with a rollback journal, so every dashboard
@@ -106,20 +106,36 @@ medium:
   embed a row per instance in their response, so their rows have to be loaded anyway
   ([../business-rules/COST.md § 4](../business-rules/COST.md#4-next-month-forecast--get-apiclientsidcost-forecast)).
 
+- **PERF-14** — *fixed.* Every diagnosis built its own `anthropic.Anthropic()`, and each
+  one owns an `httpx` client with its own connection pool — so no call could reuse the
+  connection the last one opened, and the client it abandoned was left for the garbage
+  collector to close. One client now serves the process, built on first use behind a
+  double-checked lock because 40 threadpool workers can reach a cold process at once. Ten
+  diagnoses open **1** connection instead of 10, measured against a local server standing
+  in for the provider, and every request after the first stops paying the 6–22 ms of
+  building a client. No end-to-end latency figure is quoted: the `TestClient` harness
+  varies by more between runs of one variant than the two variants differ, which the
+  finding records rather than papering over. A construction failure is not cached, so a
+  machine without a key still falls back per request rather than latching into a permanent
+  fallback
+  ([../design/LLM_FEATURE.md § 4.6](../design/LLM_FEATURE.md#46-one-client-for-the-process)).
+
 With PERF-05, PERF-06, PERF-07 and PERF-12 closed, nothing in the API grows with the size
 of what it is asked about: not a monitoring scan's statement count, not a list endpoint's
 response, and not the forecast's result set. The remaining three findings are smaller: a
-client rebuilt per LLM request (**PERF-14**), startup work repeated on every boot
-(**PERF-15**) — and one recorded deliberately rather than as a defect, the login KDF cost
-(**PERF-13**), which is correct as written and should not be changed.
+startup work repeated on every boot (**PERF-15**), which costs a long-lived `uvicorn`
+process nothing and a serverless cold start everything — and one recorded deliberately
+rather than as a defect, the login KDF cost (**PERF-13**), which is correct as written and
+should not be changed.
 
 Every figure is measured against the seeded demo database — or, where the seed is too
 small to show a difference, against that database grown with several thousand extra
 instances — not estimated; the method is at the end of the document so any number can be
-reproduced. Twelve findings, PERF-01 through PERF-12, have been fixed; the rest are
-recorded and still open. PERF-09 and PERF-12 are the two whose payoff is a wall-clock
-number rather than a statement count — both change what a query does rather than how many
-run.
+reproduced. Thirteen findings — PERF-01 through PERF-12, and PERF-14 — have been fixed;
+the rest are recorded and still open. PERF-09, PERF-12 and PERF-14 are the three whose
+payoff is a wall-clock number rather than a statement count; the first two change what a
+query does rather than how many run, and the third removes work that was never a query at
+all.
 
 ## Related
 
@@ -128,7 +144,7 @@ run.
 | [../design/ARCHITECTURE.md](../design/ARCHITECTURE.md) | The layering and session handling the findings sit in |
 | [../design/DATABASE.md](../design/DATABASE.md) | The engine, pool and session factory behind PERF-02 and PERF-06 |
 | [../design/ERD.md](../design/ERD.md) | The schema, and the indexes PERF-04 added to it |
-| [../design/LLM_FEATURE.md](../design/LLM_FEATURE.md) | The diagnosis endpoint behind PERF-03 and PERF-14 |
+| [../design/LLM_FEATURE.md](../design/LLM_FEATURE.md) | The diagnosis endpoint behind PERF-03 and PERF-14, and the client lifetime the second one settled |
 | [../business-rules/ALERTING.md](../business-rules/ALERTING.md) | The dedup rule PERF-05 had to preserve, and why PERF-07 pages a scan's response but not its detection |
 | [../api/CONVENTIONS.md](../api/CONVENTIONS.md) | The pagination convention PERF-07 extended to every list endpoint |
 | [../security/README.md](../security/README.md) | The sibling register — the same codebase reviewed for what it exposes rather than what it costs |

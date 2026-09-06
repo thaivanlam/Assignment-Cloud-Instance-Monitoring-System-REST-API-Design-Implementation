@@ -16,6 +16,7 @@ Categories follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/): **Ad
 
 | Date | Milestone | Highlights |
 |---|---|---|
+| [2026-09-05](#2026-09-05--perf-14-fixed-one-anthropic-client-for-the-process) | PERF-14 fixed | The diagnosis endpoint stops building an HTTP client, and a connection pool, per request |
 | [2026-09-05](#2026-09-05--perf-12-fixed-the-cost-forecast-counts-in-sql) | PERF-12 fixed | The forecast counts running instances with a `GROUP BY` instead of loading every one of them |
 | [2026-09-05](#2026-09-05--perf-11-fixed-the-single-object-guard-stops-loading-the-client) | PERF-11 fixed | A single-object endpoint no longer fetches a whole `clients` row to compare one integer |
 | [2026-09-05](#2026-09-05--perf-10-fixed-a-managers-scope-rides-inside-the-query) | PERF-10 fixed | A `CLIENT_MANAGER` request no longer runs a query just to find out which clients they manage |
@@ -45,6 +46,85 @@ Categories follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/): **Ad
 | [2026-08-01](#2026-08-01--client-validation-and-cascade-delete) | Client validation + cascade delete | `400` on a non-manager `managerId` |
 | [2026-07-31](#2026-07-31--monitoring-module-completed) | Monitoring module completed | Idempotent status update, deterministic ordering |
 | [2026-07-11](#2026-07-11--initial-codebase) | Initial codebase | 19 endpoints, 5 tables, MVC layout |
+
+---
+
+## 2026-09-05 — PERF-14 fixed: one Anthropic client for the process
+
+The thirteenth of the fifteen performance findings closed, and the first of the three rated
+low. No behaviour changed: the endpoint answers exactly as it did, from either path. 129
+tests pass — the 128 that existed, unchanged, plus one new one.
+
+### Fixed
+
+- **`GET /api/instances/{id}/diagnosis` reuses one SDK client.** `_llm_diagnosis` in
+  [../../app/services/llm_service.py](../../app/services/llm_service.py) constructed
+  `anthropic.Anthropic(...)` on every call. That object is not a handle to a connection —
+  it owns an `httpx` client with its own connection pool, so no diagnosis could reuse the
+  connection the previous one opened, and the client it abandoned was left for the garbage
+  collector to close. A new `_get_client()` holds one for the process and builds it on
+  first use.
+- **Ten diagnoses, one connection.** Measured by pointing the SDK at a local HTTP server
+  through `base_url`, so the transport, the pool and the keep-alive handling are the SDK's
+  real ones and nothing leaves the machine: ten diagnoses opened **10** TCP connections
+  before and **1** after. Against the real provider each of those ten was a TLS handshake
+  as well.
+- **Every request after the first stops building a client**, which the same harness times
+  at 6.2–22.5 ms depending on how busy the machine is (5.7–7.0 ms measured standalone).
+  **No end-to-end latency figure is claimed**: the `TestClient` request median varies by
+  more between two runs of the same variant — 16 ms to 27 ms for the fixed shape — than it
+  does between the variants, so the harness cannot resolve the difference, and the finding
+  says so rather than quoting a number that would not reproduce. The connection count is
+  the evidence, and it is exact.
+- **Built once even under concurrency.** Construction sits behind a double-checked
+  `threading.Lock`. These endpoints run on 40 threadpool workers, so several diagnoses can
+  reach a cold process together; without the lock each would build a client and all but one
+  would be discarded — this finding's cost, paid once more at the worst moment.
+- **A construction failure is not cached.** `_client` is assigned only on success, so a
+  machine with no credential raises inside `_get_client` on every request and falls back to
+  the rule-based answer exactly as before — a keyless process cannot get stuck in a state
+  where it stops retrying. (`.env` is still read at import, so a key added there needs a
+  restart either way; what the uncached failure covers is a credential the SDK resolves for
+  itself, such as an `ant auth login` profile written after the server started.) The
+  credential branch itself is unchanged, and both branches still carry the 30-second timeout
+  and single retry [PERF-03](#2026-09-01--perf-03-fixed-the-llm-call-is-bounded-and-holds-no-connection) added — the
+  limits now belong to the one client rather than being re-applied per call.
+- **Not done: closing the client at shutdown.** Its pool is released when the process exits.
+  Closing it in the lifespan hook is one line, and is only correct once nothing can call
+  `diagnose` after shutdown has begun — a claim about the server, not about this module.
+
+### Added
+
+- **`test_the_provider_client_is_built_once_and_reused`** in
+  [../../tests/test_diagnosis.py](../../tests/test_diagnosis.py), recorded as **TC-DIAG-09**.
+  It drives two diagnoses through a stubbed SDK and asserts one client was constructed, with
+  the timeout and retry cap on it. Against the pre-fix shape it reads two. The autouse
+  `offline` fixture now also clears `llm_service._client`, without which a stubbed client
+  would outlive the test that installed it.
+
+### Documentation
+
+- [../performance/PERFORMANCE_BUGS.md](../performance/PERFORMANCE_BUGS.md) — PERF-14 marked
+  **Fixed**, with what landed, the connection and latency tables, why the lock and the
+  uncached failure are load-bearing, and what was left undone. The measurement section
+  records the local-server connection count and the interleaved paired latency runs, and
+  the suggested order of work gains step 11. PERF-03's closing note, which pointed at this
+  finding as still open, now points at it as closed.
+- [../design/LLM_FEATURE.md](../design/LLM_FEATURE.md) — a new § 4.6 on the process-wide
+  client: the three properties of the shape and the measurements behind it. § 2.1's Path A
+  walk-through and § 3.5's authentication note follow the code, the Path B trigger table
+  says where a missing credential now raises, and § 8 records the one thing this trades
+  away — the client outlives a key rotated in `.env`.
+- [../onboarding/READING_ORDER.md](../onboarding/READING_ORDER.md) — `_get_client` is a new
+  stop 76, so stage 8 has five and the stops after it shift by one, 82 numbered stops
+  becoming 83.
+- [../testing/FUNCTIONAL_TESTS.md](../testing/FUNCTIONAL_TESTS.md),
+  [../testing/TEST_CASES.md](../testing/TEST_CASES.md),
+  [../performance/README.md](../performance/README.md), [../security/README.md](../security/README.md),
+  [../security/SECURITY_BUGS.md](../security/SECURITY_BUGS.md) and the test counts in
+  [../../README.md](../../README.md) and [../../CLAUDE.md](../../CLAUDE.md) — the new case,
+  TC-DIAG-09, why the `offline` fixture clears the cached client, 13 of 15 findings fixed,
+  128 → 129.
 
 ---
 
