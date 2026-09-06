@@ -9,6 +9,7 @@ Instance Monitoring System: **automatic incident diagnosis for a cloud instance*
 | Provider / SDK | Anthropic Claude, official `anthropic` Python SDK (`>=0.116.0`) |
 | Model | `claude-opus-4-8` |
 | Request limits | 30 s timeout, 1 retry — 60 s worst case |
+| SDK client | One per process, built on first use (§ 4.6) |
 | Service module | [app/services/llm_service.py](../../app/services/llm_service.py) |
 | Controller | [app/controllers/instance_controller.py:98-135](../../app/controllers/instance_controller.py#L98-L135) |
 | Response DTO | `DiagnosisResponse` in [app/schemas/schemas.py:144-149](../../app/schemas/schemas.py#L144-L149) |
@@ -86,17 +87,15 @@ Triggered when `anthropic.Anthropic()` resolves a credential (`ANTHROPIC_API_KEY
 ```
 diagnose()
   └─ _llm_diagnosis()
-       1. import anthropic
-       2. client = anthropic.Anthropic(          # credential from .env or env
-              timeout=30.0, max_retries=1)
-       3. _build_context(instance, alerts)        # flatten ORM rows to text
-       4. client.messages.create(
+       1. _get_client()                           # the process's one client, § 4.6
+       2. _build_context(instance, alerts)        # flatten ORM rows to text
+       3. client.messages.create(
               model="claude-opus-4-8", max_tokens=16000,
               thinking={"type": "adaptive"},
               system=<persona + 3-section contract>,
               messages=[{"role": "user", "content": task + context}])
-       5. join blocks where block.type == "text", strip
-       6. return text  (or None if empty)
+       4. join blocks where block.type == "text", strip
+       5. return text  (or None if empty)
   └─ return (text, "llm")
 ```
 
@@ -112,14 +111,14 @@ Triggered when **any** of the following occurs — all are caught by the same
 
 | Trigger | What actually raises |
 |---|---|
-| No credential configured at all | SDK raises on client construction / first request |
+| No credential configured at all | SDK raises inside `_get_client` (§ 4.6), on every request — the failure is not cached |
 | Invalid or revoked key | `AuthenticationError` (401) |
 | Key lacks model access | `PermissionDeniedError` (403) |
 | Rate limit or quota exhausted | `RateLimitError` (429) |
 | Provider outage | `APIStatusError` (5xx) |
 | Provider slower than 30 s, twice | `APITimeoutError` after the retry (§ 4.5) |
 | No network (offline demo, air-gapped CI) | `APIConnectionError` |
-| `anthropic` package not installed | `ImportError` |
+| `anthropic` package not installed | `ImportError` from the import inside `_get_client` |
 | Model returned only non-text blocks | text empty after strip → `None` |
 
 ```
@@ -274,7 +273,11 @@ key and the SDK resolves credentials itself in the standard order: `ANTHROPIC_AP
 from the shell, then `ANTHROPIC_AUTH_TOKEN`, then a local `ant auth login` profile. No
 key is ever hard-coded, and the key is not required for the endpoint to work.
 
-Both branches construct the client with the same request limits (§ 4.5).
+Both branches construct the client with the same request limits (§ 4.5), and both do so
+once for the process rather than once per request (§ 4.6). The credential is therefore
+read at the first diagnosis, not at import and not on every call: a key added to `.env`
+after the server is running is picked up by the next request only because a failed
+construction is never cached — see § 4.6.
 
 ---
 
@@ -388,6 +391,55 @@ raises `DetachedInstanceError`.
 
 Measured with 20 concurrent diagnosis requests all inside the provider call at once: 20
 connections held before, **0** after.
+
+### 4.6 One client for the process
+
+`anthropic.Anthropic()` is not a handle to a connection — it *owns* an `httpx` client with
+its own connection pool. Building one per diagnosis meant no call could reuse the
+connection the last one opened, and the client it left behind was closed by the garbage
+collector rather than by anyone
+([../performance/PERFORMANCE_BUGS.md § PERF-14](../performance/PERFORMANCE_BUGS.md#perf-14)).
+
+`_get_client()` holds one for the whole process:
+
+```python
+_client = None
+_client_lock = threading.Lock()
+
+def _get_client():
+    global _client
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                import anthropic
+                ...
+                _client = anthropic.Anthropic(...)   # the § 3.5 credential branch,
+    return _client                                   # with the § 4.5 limits
+```
+
+Three properties this shape has, each of them load-bearing:
+
+- **Built on first use, not at import.** The module stays importable with no credential
+  configured, which is what lets the test suite and every keyless demo import it.
+- **Built once under concurrency.** The endpoint runs on FastAPI's threadpool, so several
+  diagnoses can arrive at a cold process together. The double-checked lock means they
+  share one client instead of building 40 and discarding 39.
+- **A failure is not cached.** `_client` is assigned only when construction succeeds. With
+  no credential the SDK raises here, `_llm_diagnosis` catches it like any other provider
+  failure (§ 4.3) and the caller gets the rule-based answer — and the *next* request tries
+  again, so a keyless process behaves exactly as it did before and never latches into a
+  permanent fallback. It is not a way to change the key while running: `settings` is read
+  at import, so `.env` still needs a restart. What it does pick up is a credential the SDK
+  resolves for itself, such as an `ant auth login` profile written after the server
+  started.
+
+Measured against a local server standing in for the provider, ten diagnoses open **one**
+TCP connection where they opened ten before, and every request after the first stops
+paying the 6–22 ms a client costs to build.
+
+The client is deliberately **not** closed at shutdown. Its pool is released when the
+process exits; closing it in the lifespan hook would be one line, and is only correct once
+nothing can call `diagnose` after shutdown has begun.
 
 ---
 
@@ -524,6 +576,10 @@ fallback so its causes stay consistent with the monitoring rules used elsewhere.
   threadpool workers for up to 60 seconds. Its database connection is released first
   (§ 4.5), so the pool is not affected, but the worker is still held; freeing that too
   means the async client (`AsyncAnthropic`) with an `async def` endpoint.
+- **The client outlives the settings.** `_get_client` reads `ANTHROPIC_API_KEY` once, at
+  the first successful construction (§ 4.6). Rotating the key in `.env` afterwards has no
+  effect until the process restarts — acceptable for a demo, and the fix is a reset hook
+  rather than a client per request.
 - **No usage tracking.** `response.usage` is discarded; recording input/output tokens
   per call would enable cost attribution per client.
 - **Single language.** Output is pinned to English. A `lang` query parameter mapped
@@ -540,5 +596,5 @@ fallback so its causes stay consistent with the monitoring rules used elsewhere.
 | [../api/ENDPOINTS.md](../api/ENDPOINTS.md) | `DiagnosisResponse` in the endpoint reference |
 | [../api/ERRORS.md](../api/ERRORS.md) | Why there is no `5xx` for provider failures |
 | [../business-rules/ALERTING.md](../business-rules/ALERTING.md) | How the alert history in the prompt is produced |
-| [../performance/PERFORMANCE_BUGS.md](../performance/PERFORMANCE_BUGS.md) | PERF-03, the request limits and the connection release of § 4.5 |
+| [../performance/PERFORMANCE_BUGS.md](../performance/PERFORMANCE_BUGS.md) | PERF-03, the request limits and the connection release of § 4.5; PERF-14, the one client of § 4.6 |
 | [../demo/WALKTHROUGH.md](../demo/WALKTHROUGH.md) | Demo step for this endpoint |
