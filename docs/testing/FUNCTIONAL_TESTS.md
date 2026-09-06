@@ -102,7 +102,7 @@ are what keeps those documents honest.
 
 ## 4. The suites
 
-128 cases across six files. Each file covers one area of the API.
+129 cases across six files. Each file covers one area of the API.
 
 ### 4.1 `test_auth.py` — health check and the JWT guard (19 cases)
 
@@ -231,7 +231,7 @@ Rules: [../business-rules/COST.md](../business-rules/COST.md),
 [../business-rules/SLA.md](../business-rules/SLA.md),
 [../business-rules/AUTHORIZATION.md](../business-rules/AUTHORIZATION.md).
 
-### 4.6 `test_diagnosis.py` — the LLM endpoint (7 cases)
+### 4.6 `test_diagnosis.py` — the LLM endpoint (8 cases)
 
 | Case | Pins |
 |---|---|
@@ -240,6 +240,7 @@ Rules: [../business-rules/COST.md](../business-rules/COST.md),
 | `diagnosis_is_given_the_instance_and_its_recent_alerts` | The controller feeds the instance and *its* alerts into the diagnosis |
 | `diagnosis_survives_a_provider_failure` | A raising SDK yields `200` + rule-based, never a `5xx` |
 | `diagnosis_returns_the_text_the_provider_produced` | Real provider path against a stubbed SDK: prompt carries the instance, thinking blocks are dropped, text blocks are returned |
+| `the_provider_client_is_built_once_and_reused` | Two diagnoses construct **one** SDK client, and it carries the 30 s timeout and single retry |
 | `diagnosis_works_for_a_healthy_instance_too` | The endpoint is not restricted to ERROR instances |
 | `diagnosis_enforces_scope_and_existence` | `403` / `404` |
 
@@ -282,9 +283,15 @@ test suite must not depend on a network service or an API key, and a non-determi
 answer cannot be asserted on.
 
 The autouse `offline` fixture patches `llm_service._llm_diagnosis` to return `None`,
-which is exactly the state of a machine with no credentials. Two cases restore the real
+which is exactly the state of a machine with no credentials. Three cases restore the real
 function and stub `anthropic.Anthropic` instead, so the provider path — prompt assembly,
-response parsing, failure handling — is executed for real against a fake SDK.
+response parsing, failure handling, and the one client the process reuses — is executed
+for real against a fake SDK.
+
+The same fixture also clears `llm_service._client`. The SDK client is built once per
+process and cached ([../performance/PERFORMANCE_BUGS.md § PERF-14](../performance/PERFORMANCE_BUGS.md#perf-14)),
+so without that reset a stubbed client would outlive the test that installed it and the
+next case to build one would silently get the previous one's.
 
 No other test touches the network, so the whole suite runs offline.
 
